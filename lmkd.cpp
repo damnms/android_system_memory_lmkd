@@ -1544,6 +1544,11 @@ static void ctrl_connect_handler(int data __unused, uint32_t events __unused,
  *       (<unused fields>)*
  *   )+
  *   ...
+ *
+ * Kernels before 4.8 have no "per-node stats" section: the zone data starts
+ * right after the node line and the per-node fields (nr_inactive_file,
+ * nr_active_file) are part of each zone, so they are summed up per node.
+ * workingset_refault only exists since 3.15 and stays 0 there.
  */
 static void zoneinfo_parse_protection(char *buf, struct zoneinfo_zone *zone) {
     int zone_idx;
@@ -1562,7 +1567,8 @@ static void zoneinfo_parse_protection(char *buf, struct zoneinfo_zone *zone) {
     zone->max_protection = max;
 }
 
-static int zoneinfo_parse_zone(char **buf, struct zoneinfo_zone *zone) {
+static int zoneinfo_parse_zone(char **buf, struct zoneinfo_zone *zone,
+                               struct zoneinfo_node *legacy_node) {
     for (char *line = strtok_r(NULL, "\n", buf); line;
          line = strtok_r(NULL, "\n", buf)) {
         char *cp;
@@ -1605,6 +1611,18 @@ static int zoneinfo_parse_zone(char **buf, struct zoneinfo_zone *zone) {
         }
         if (match_res == PARSE_SUCCESS) {
             zone->fields.arr[field_idx] = val;
+        } else if (legacy_node) {
+            /* pre-4.8 kernel: per-node fields are reported per zone */
+            int node_field_idx;
+            match_res = match_field(cp, ap, zoneinfo_node_field_names, ZI_NODE_FIELD_COUNT,
+                &val, &node_field_idx);
+            if (match_res == PARSE_FAIL) {
+                return false;
+            }
+            if (match_res == PARSE_SUCCESS) {
+                legacy_node->fields.arr[node_field_idx] += val;
+            }
+            continue;
         }
         if (field_idx == ZI_ZONE_PRESENT && val == 0) {
             /* zone is not populated, stop parsing it */
@@ -1614,8 +1632,10 @@ static int zoneinfo_parse_zone(char **buf, struct zoneinfo_zone *zone) {
     return false;
 }
 
-static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
+static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node, bool *legacy) {
     int fields_to_match = ZI_NODE_FIELD_COUNT;
+
+    *legacy = false;
 
     for (char *line = strtok_r(NULL, "\n", buf); line;
          line = strtok_r(NULL, "\n", buf)) {
@@ -1629,6 +1649,12 @@ static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
         cp = strtok_r(line, " ", &save_ptr);
         if (!cp) {
             return false;
+        }
+
+        if (!strcmp(cp, "pages")) {
+            /* "pages free": zone data without per-node stats (kernel < 4.8) */
+            *legacy = true;
+            return true;
         }
 
         ap = strtok_r(NULL, " ", &save_ptr);
@@ -1664,6 +1690,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
     struct zoneinfo_node *node = NULL;
     int node_idx = 0;
     int zone_idx = 0;
+    bool legacy = false;
 
     memset(zi, 0, sizeof(struct zoneinfo));
 
@@ -1689,7 +1716,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 node = &zi->nodes[node_idx];
                 node->id = node_id;
                 zone_idx = 0;
-                if (!zoneinfo_parse_node(&save_ptr, node)) {
+                if (!zoneinfo_parse_node(&save_ptr, node, &legacy)) {
                     ALOGE("%s parse error", file_data.filename);
                     return -1;
                 }
@@ -1697,7 +1724,8 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 /* new zone is found */
                 zone_idx++;
             }
-            if (!zoneinfo_parse_zone(&save_ptr, &node->zones[zone_idx])) {
+            if (!zoneinfo_parse_zone(&save_ptr, &node->zones[zone_idx],
+                                     legacy ? node : NULL)) {
                 ALOGE("%s parse error", file_data.filename);
                 return -1;
             }
